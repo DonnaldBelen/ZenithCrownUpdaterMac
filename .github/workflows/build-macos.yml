@@ -1,0 +1,41 @@
+name: Build macOS Updater
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Intel binary
+        run: |
+          swift build -c release --arch x86_64
+          cp .build/x86_64-apple-macosx/release/ZenithCrownUpdater /tmp/ZenithCrownUpdater-x86_64
+
+      - name: Build Apple Silicon binary
+        run: |
+          swift build -c release --arch arm64
+          cp .build/arm64-apple-macosx/release/ZenithCrownUpdater /tmp/ZenithCrownUpdater-arm64
+
+      - name: Create universal app
+        run: |
+          APP="dist/Zenith Crown Online Updater.app"
+          mkdir -p "$APP/Contents/MacOS"
+          lipo -create \
+            /tmp/ZenithCrownUpdater-x86_64 \
+            /tmp/ZenithCrownUpdater-arm64 \
+            -output "$APP/Contents/MacOS/ZenithCrownUpdater"
+          cp Info.plist "$APP/Contents/Info.plist"
+          chmod +x "$APP/Contents/MacOS/ZenithCrownUpdater"
+          codesign --force --deep --sign - "$APP"
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "dist/Zenith-Crown-Online-Updater-macOS.zip"
+
+      - name: Upload application
+        uses: actions/upload-artifact@v4
+        with:
+          name: Zenith-Crown-Online-Updater-macOS
+          path: dist/Zenith-Crown-Online-Updater-macOS.zip
