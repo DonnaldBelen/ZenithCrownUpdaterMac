@@ -5,24 +5,15 @@ import SwiftUI
 
 private let baseURL = URL(string: "https://zenithcrown.net/files/")!
 
-struct UpdateFile {
-    let localPath: String
-    let remoteName: String
-}
-
 enum UpdaterError: LocalizedError {
-    case invalidManifestLine(String)
     case missingChecksum(String)
     case checksumMismatch(String)
-    case unsafePath(String)
     case invalidResponse
 
     var errorDescription: String? {
         switch self {
-        case .invalidManifestLine(let line): return "Invalid manifest line: \(line)"
         case .missingChecksum(let file): return "No checksum found for \(file)"
         case .checksumMismatch(let file): return "Checksum verification failed for \(file)"
-        case .unsafePath(let path): return "Unsafe destination path rejected: \(path)"
         case .invalidResponse: return "The update server returned an invalid response."
         }
     }
@@ -41,11 +32,11 @@ final class DownloadDelegate: NSObject, URLSessionDownloadDelegate {
     }
 
     func download(from url: URL) async throws {
+        defer { session.invalidateAndCancel() }
         try await withCheckedThrowingContinuation { continuation in
             self.continuation = continuation
             session.downloadTask(with: url).resume()
         }
-        session.invalidateAndCancel()
     }
 
     func urlSession(
@@ -65,6 +56,10 @@ final class DownloadDelegate: NSObject, URLSessionDownloadDelegate {
         didFinishDownloadingTo location: URL
     ) {
         do {
+            guard let response = downloadTask.response as? HTTPURLResponse,
+                  (200...299).contains(response.statusCode) else {
+                throw UpdaterError.invalidResponse
+            }
             let manager = FileManager.default
             try manager.createDirectory(
                 at: destination.deletingLastPathComponent(),
@@ -104,6 +99,38 @@ final class UpdaterModel: ObservableObject {
     @Published var progress = 0.0
     @Published var isUpdating = false
     @Published var updateComplete = false
+    @Published var logURL: URL?
+
+    private func log(_ message: String) {
+        guard let logURL else { return }
+        let line = "\(ISO8601DateFormatter().string(from: Date())) \(message)\n"
+        do {
+            let handle = try FileHandle(forWritingTo: logURL)
+            defer { try? handle.close() }
+            try handle.seekToEnd()
+            try handle.write(contentsOf: Data(line.utf8))
+        } catch {
+            NSLog("Updater logging failed: %@", error.localizedDescription)
+        }
+    }
+
+    private func beginLog(clientFolder: URL) throws {
+        logURL = nil
+        let folder = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Logs/ZenithCrownUpdater", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let url = folder.appendingPathComponent("update-\(UUID().uuidString).log")
+        try Data().write(to: url, options: .atomic)
+        logURL = url
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "development"
+        log("Updater \(version); client folder: \(clientFolder.path)")
+        log("App: \(Bundle.main.bundleURL.path)")
+    }
+
+    func showLog() {
+        guard let logURL else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([logURL])
+    }
 
     func chooseClientFolder() {
         let panel = NSOpenPanel()
@@ -129,12 +156,15 @@ final class UpdaterModel: ObservableObject {
 
         Task {
             do {
+                try beginLog(clientFolder: clientFolder)
                 try await update(clientFolder: clientFolder)
+                log("Update complete; cleanup finished.")
                 status = "Update complete."
                 detail = "Your client files are ready."
                 progress = 1
                 updateComplete = true
             } catch {
+                log("Update failed: \(error)")
                 status = "Update failed."
                 detail = error.localizedDescription
             }
@@ -155,7 +185,11 @@ final class UpdaterModel: ObservableObject {
         async let checksumData = fetchControlFile("checksums.txt")
         let (manifest, checksums) = try await (manifestData, checksumData)
 
-        let files = try parseManifest(manifest)
+        let plan = try UpdateManifest.parse(manifest, root: clientFolder)
+        let files = plan.files
+        var verified = Set<String>()
+        log("Manifest: \(files.count) downloads, \(plan.deletes.count) deletion directives")
+        log("Manifest MD5: \(Insecure.MD5.hash(data: Data(manifest.utf8)).map { String(format: "%02x", $0) }.joined())")
         let remoteHashes = parseChecksums(checksums)
 
         for (index, file) in files.enumerated() {
@@ -163,19 +197,23 @@ final class UpdaterModel: ObservableObject {
             status = "Checking file \(fileNumber) of \(files.count)"
             detail = file.remoteName
 
-            let destination = try safeDestination(root: clientFolder, relativePath: file.localPath)
+            let destination = try UpdateManifest.destination(root: clientFolder, relativePath: file.localPath)
             guard let expectedHash = remoteHashes[file.remoteName.lowercased()] else {
                 throw UpdaterError.missingChecksum(file.remoteName)
             }
 
             if FileManager.default.fileExists(atPath: destination.path),
                try md5(destination) == expectedHash.lowercased() {
+                verified.insert(destination.path)
                 progress = Double(fileNumber) / Double(max(files.count, 1))
                 continue
             }
 
             status = "Downloading \(fileNumber) of \(files.count)"
-            let temporary = destination.appendingPathExtension("download")
+            let temporary = try UpdateManifest.destination(
+                root: clientFolder, relativePath: file.localPath + ".\(UUID().uuidString).download"
+            )
+            defer { try? FileManager.default.removeItem(at: temporary) }
             let remoteURL = remoteFileURL(file.remoteName)
             let completedFileCount = index
             let totalFileCount = max(files.count, 1)
@@ -192,18 +230,30 @@ final class UpdaterModel: ObservableObject {
                 throw UpdaterError.checksumMismatch(file.remoteName)
             }
 
+            // Recheck after the network await before changing the installed file.
+            _ = try UpdateManifest.destination(root: clientFolder, relativePath: file.localPath)
             let manager = FileManager.default
             try manager.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
             if manager.fileExists(atPath: destination.path) {
                 try manager.removeItem(at: destination)
             }
             try manager.moveItem(at: temporary, to: destination)
+            verified.insert(destination.path)
             progress = Double(fileNumber) / Double(max(files.count, 1))
+        }
+
+        status = "Removing obsolete files..."
+        try plan.applyDeletes(root: clientFolder, verified: verified) { message in
+            detail = message
+            log(message)
         }
     }
 
     private func fetchControlFile(_ name: String) async throws -> String {
-        var request = URLRequest(url: baseURL.appendingPathComponent(name))
+        var components = URLComponents(url: baseURL.appendingPathComponent(name), resolvingAgainstBaseURL: false)!
+        components.queryItems = [URLQueryItem(name: "t", value: UUID().uuidString)]
+        var request = URLRequest(url: components.url!)
+        request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
         request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         request.timeoutInterval = 30
         let (data, response) = try await URLSession.shared.data(for: request)
@@ -212,20 +262,6 @@ final class UpdaterModel: ObservableObject {
             throw UpdaterError.invalidResponse
         }
         return text
-    }
-
-    private func parseManifest(_ text: String) throws -> [UpdateFile] {
-        try text.split(whereSeparator: \.isNewline).compactMap { raw in
-            let line = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !line.isEmpty, !line.hasPrefix("#") else { return nil }
-            let parts = line.split(separator: "|", maxSplits: 1).map {
-                $0.trimmingCharacters(in: .whitespacesAndNewlines)
-            }
-            guard parts.count == 2, !parts[0].isEmpty, !parts[1].isEmpty else {
-                throw UpdaterError.invalidManifestLine(line)
-            }
-            return UpdateFile(localPath: parts[0], remoteName: parts[1])
-        }
     }
 
     private func parseChecksums(_ text: String) -> [String: String] {
@@ -242,19 +278,6 @@ final class UpdaterModel: ObservableObject {
             result[name.lowercased()] = hash.lowercased()
         }
         return result
-    }
-
-    private func safeDestination(root: URL, relativePath: String) throws -> URL {
-        let normalized = relativePath.replacingOccurrences(of: "\\", with: "/")
-        guard !normalized.hasPrefix("/"), !normalized.contains(":") else {
-            throw UpdaterError.unsafePath(relativePath)
-        }
-        let destination = root.appendingPathComponent(normalized).standardizedFileURL
-        let rootPath = root.standardizedFileURL.path
-        guard destination.path.hasPrefix(rootPath + "/") else {
-            throw UpdaterError.unsafePath(relativePath)
-        }
-        return destination
     }
 
     private func remoteFileURL(_ name: String) -> URL {
@@ -312,6 +335,10 @@ struct ContentView: View {
                 }
                 .keyboardShortcut(.defaultAction)
                 .disabled(updater.clientFolder == nil || updater.isUpdating)
+
+                if updater.logURL != nil {
+                    Button("Show Log") { updater.showLog() }
+                }
 
                 if updater.updateComplete {
                     Button("Open Client Folder") {

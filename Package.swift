@@ -8,6 +8,7 @@ let package = Package(
         .executable(name: "ZenithCrownUpdater", targets: ["ZenithCrownUpdater"])
     ],
     targets: [
-        .executableTarget(name: "ZenithCrownUpdater")
+        .executableTarget(name: "ZenithCrownUpdater"),
+        .testTarget(name: "ZenithCrownUpdaterTests", dependencies: ["ZenithCrownUpdater"])
     ]
 )

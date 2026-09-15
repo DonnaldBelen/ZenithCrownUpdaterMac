@@ -11,6 +11,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Test manifest and deletion safety
+        run: swift test
+
       - name: Build Intel binary
         run: |
           swift build -c release --arch x86_64
