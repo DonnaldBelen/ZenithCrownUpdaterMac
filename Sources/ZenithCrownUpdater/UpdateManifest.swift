@@ -112,7 +112,9 @@ struct UpdateManifest {
                     throw ManifestError.unsafePath(current.path)
                 }
             }
-            if current.path == "/" { break }
+            // Validate the selected folder itself, but not OS-managed ancestors
+            // above it (macOS commonly routes /var through a system symlink).
+            if current.path == base.path { break }
             current.deleteLastPathComponent()
         }
         return target

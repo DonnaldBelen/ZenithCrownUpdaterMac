@@ -219,7 +219,7 @@ final class UpdaterModel: ObservableObject {
             let totalFileCount = max(files.count, 1)
             let downloader = DownloadDelegate(destination: temporary) { [self] fileProgress in
                 Task { @MainActor [self] in
-                    progress = (Double(completedFileCount) + fileProgress) / Double(totalFileCount)
+                    self.progress = (Double(completedFileCount) + fileProgress) / Double(totalFileCount)
                 }
             }
             try await downloader.download(from: remoteURL)

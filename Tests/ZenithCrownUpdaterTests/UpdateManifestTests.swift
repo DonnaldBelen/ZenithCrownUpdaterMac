@@ -118,6 +118,23 @@ final class UpdateManifestTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: real.path))
     }
 
+    func testSystemVarAncestorIsAllowed() throws {
+        let folder = URL(fileURLWithPath: "/var/tmp", isDirectory: true)
+            .appendingPathComponent("ZenithBoundaryTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let destination = try UpdateManifest.destination(root: folder, relativePath: "missing/old.lub")
+        XCTAssertEqual(destination.path, folder.appendingPathComponent("missing/old.lub").standardizedFileURL.path)
+    }
+
+    func testSelectedRootSymlinkIsRejected() throws {
+        let real = root.appendingPathComponent("real", isDirectory: true)
+        try FileManager.default.createDirectory(at: real, withIntermediateDirectories: true)
+        let alias = root.appendingPathComponent("alias", isDirectory: true)
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: real)
+        XCTAssertThrowsError(try UpdateManifest.destination(root: alias, relativePath: "old.lub"))
+    }
+
     func testMalformedConflictingAndDuplicateEntries() throws {
         for text in [
             "#delete|old.lub",
